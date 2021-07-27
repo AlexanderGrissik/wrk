@@ -1,8 +1,16 @@
 // Copyright (C) 2012 - Will Glozer.  All rights reserved.
 
+#include <assert.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #include "wrk.h"
 #include "script.h"
 #include "main.h"
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+#endif
 
 static struct config {
     uint64_t connections;
@@ -13,8 +21,10 @@ static struct config {
     bool     delay;
     bool     dynamic;
     bool     latency;
+    bool     clean_shutdown;
     char    *host;
     char    *script;
+    char    *local_ip;
     SSL_CTX *ctx;
 } cfg;
 
@@ -45,6 +55,8 @@ static void usage() {
     printf("Usage: wrk <options> <url>                            \n"
            "  Options:                                            \n"
            "    -c, --connections <N>  Connections to keep open   \n"
+           "    -i, --local_ip    <S>  Bind to the specified local IP(s)\n"
+           "                           It can be a comma separated list\n"
            "    -d, --duration    <T>  Duration of test           \n"
            "    -t, --threads     <N>  Number of threads to use   \n"
            "                                                      \n"
@@ -52,6 +64,7 @@ static void usage() {
            "    -H, --header      <H>  Add header to request      \n"
            "        --latency          Print latency statistics   \n"
            "        --timeout     <T>  Socket/request timeout     \n"
+	   "        --clean-shdwn      Clean shutdown             \n"
            "    -v, --version          Print version details      \n"
            "                                                      \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
@@ -101,10 +114,34 @@ int main(int argc, char **argv) {
 
     cfg.host = host;
 
+    // Split comma separated IPs list into the array.
+    char *local_ip_arr[32];
+    size_t local_ip_nr = 0;
+    char *local_ip_tokens = cfg.local_ip != NULL ? strdup(cfg.local_ip) : NULL;
+    if (local_ip_tokens != NULL) {
+        char *saveptr = NULL;
+        char *token = strtok_r(local_ip_tokens, ",", &saveptr);
+
+        while (token != NULL) {
+            if (*token != '\0') {
+                if (local_ip_nr >= ARRAY_SIZE(local_ip_arr)) {
+                    fprintf(stderr, "Number of IPs exceeds predefined maximum (%zu). "
+                            "Ignoring the extra addresses.\n", ARRAY_SIZE(local_ip_arr));
+                    break;
+                }
+                local_ip_arr[local_ip_nr++] = token;
+            }
+            token = strtok_r(NULL, ",", &saveptr);
+        }
+    }
+
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t      = &threads[i];
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = cfg.connections / cfg.threads;
+
+        if (local_ip_nr > 0)
+            t->local_ip = local_ip_arr[i % local_ip_nr];
 
         t->L = script_create(cfg.script, url, headers);
         script_init(L, t, argc - optind, &argv[optind]);
@@ -196,6 +233,8 @@ int main(int argc, char **argv) {
         script_done(L, statistics.latency, statistics.requests);
     }
 
+    free(local_ip_tokens);
+
     return 0;
 }
 
@@ -233,12 +272,29 @@ void *thread_main(void *arg) {
     return NULL;
 }
 
+void bind_socket(int fd, char *addr)
+{
+    struct sockaddr_in sa;
+    int rc;
+
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    rc = inet_aton(addr, &sa.sin_addr);
+    assert(rc != 0);
+    rc = bind(fd, (struct sockaddr*)&sa, sizeof sa);
+    assert(rc == 0);
+}
+
+
 static int connect_socket(thread *thread, connection *c) {
     struct addrinfo *addr = thread->addr;
     struct aeEventLoop *loop = thread->loop;
     int fd, flags;
 
     fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+
+    if (thread->local_ip != NULL)
+        bind_socket(fd, thread->local_ip);
 
     flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -258,6 +314,7 @@ static int connect_socket(thread *thread, connection *c) {
     }
 
   error:
+    printf("connect_socket error: errno=%d\n", errno);
     thread->errors.connect++;
     close(fd);
     return -1;
@@ -265,7 +322,29 @@ static int connect_socket(thread *thread, connection *c) {
 
 static int reconnect_socket(thread *thread, connection *c) {
     aeDeleteFileEvent(thread->loop, c->fd, AE_WRITABLE | AE_READABLE);
-    sock.close(c);
+    sock.close(c, cfg.clean_shutdown);
+
+    if (cfg.clean_shutdown) {
+        char buf[1024];
+        while (1) {
+            int rc = recv(c->fd, buf, 1024, MSG_WAITALL);
+	    if (rc <= 0) {
+	        if (rc < 0) {
+	            if (errno != EAGAIN && errno != EWOULDBLOCK)
+	                printf("close socket recv error: errno=%d\n", errno);
+		    else if (wait_for_single_socket_simple(c->fd, WAIT_READ))
+			continue;
+	        }
+
+		break;
+	    } else {
+	        //printf("data on closing socket %d\n", c->fd);
+	    }
+	}
+
+	shutdown(c->fd, SHUT_WR);
+    } 
+
     close(c->fd);
     return connect_socket(thread, c);
 }
@@ -476,6 +555,8 @@ static struct option longopts[] = {
     { "timeout",     required_argument, NULL, 'T' },
     { "help",        no_argument,       NULL, 'h' },
     { "version",     no_argument,       NULL, 'v' },
+    { "clean-shdwn", no_argument,       NULL, 'C' },
+    { "local_ip",    required_argument, NULL, 'i' },
     { NULL,          0,                 NULL,  0  }
 };
 
@@ -489,7 +570,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:i:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -497,7 +578,10 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
             case 'c':
                 if (scan_metric(optarg, &cfg->connections)) return -1;
                 break;
-            case 'd':
+	    case 'i':
+		cfg->local_ip = optarg;
+		break;
+	    case 'd':
                 if (scan_time(optarg, &cfg->duration)) return -1;
                 break;
             case 's':
@@ -517,6 +601,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 printf("wrk %s [%s] ", VERSION, aeGetApiName());
                 printf("Copyright (C) 2012 Will Glozer\n");
                 break;
+	    case 'C':
+		cfg->clean_shutdown = true;
+		break;
             case 'h':
             case '?':
             case ':':

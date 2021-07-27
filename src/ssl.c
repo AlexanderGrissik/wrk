@@ -8,6 +8,12 @@
 
 #include "ssl.h"
 
+#define IS_TLS_ERR_WANT_RW(e) (SSL_ERROR_WANT_READ == (e) || SSL_ERROR_WANT_WRITE == (e))
+
+#define TLS_WAIT_WHICH(e)                                                                          \
+    (((e) == SSL_ERROR_WANT_READ || (e) == SSL_ERROR_WANT_CONNECT) ? WAIT_READ : 0) |          \
+        (((e) == SSL_ERROR_WANT_WRITE || (e) == SSL_ERROR_WANT_CONNECT) ? WAIT_WRITE : 0)
+
 SSL_CTX *ssl_init() {
     SSL_CTX *ctx = NULL;
 
@@ -39,8 +45,28 @@ status ssl_connect(connection *c, char *host) {
     return OK;
 }
 
-status ssl_close(connection *c) {
-    SSL_shutdown(c->ssl);
+status ssl_close(connection *c, bool clean) {
+    /*if (!clean) {
+       SSL_shutdown(c->ssl);
+    } else {
+       bool shuttingDown = true;
+       while (shuttingDown) {
+           int rc = SSL_shutdown(c->ssl);
+           if (rc < 0) {
+               int err = SSL_get_error(c->ssl, rc);
+               if (IS_TLS_ERR_WANT_RW(err)) {
+	           if (!wait_for_single_socket_simple(SSL_get_fd(c->ssl), TLS_WAIT_WHICH(err)))
+                       shuttingDown = false;
+               } else {
+                   printf("Error: SSL_shutdown, errno=%d\n", errno);
+                   shuttingDown = false;
+               } 
+      	   } else if (rc > 0) {
+               shuttingDown = false;
+           }
+        }
+    }*/
+
     SSL_clear(c->ssl);
     return OK;
 }

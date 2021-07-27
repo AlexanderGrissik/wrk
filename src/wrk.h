@@ -33,6 +33,7 @@ typedef struct {
     uint64_t requests;
     uint64_t bytes;
     uint64_t start;
+    char *local_ip;
     lua_State *L;
     errors errors;
     struct connection *cs;

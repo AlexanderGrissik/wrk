@@ -93,6 +93,14 @@ $(ODIR)/lib/libssl.a: $(ODIR)/$(OPENSSL)
 ifeq ($(TARGET), darwin)
 	@$(SHELL) -c "cd $< && ./Configure $(OPENSSL_OPTS) darwin64-x86_64-cc"
 else
+	@echo WRK config openssl $(OPENSSL_OPTS)
+	@sed -i "s#'File::Glob' => qw/glob/;#'File::Glob' => qw/bsd_glob/;#g" $</test/recipes/90-test_fuzz.t
+	@sed -i "s#'File::Glob' => qw/glob/;#'File::Glob' => qw/bsd_glob/;#g" $</test/recipes/80-test_ssl_new.t
+	@sed -i "s#'File::Glob' => qw/glob/;#'File::Glob' => qw/bsd_glob/;#g" $</test/recipes/40-test_rehash.t
+	@sed -i "s#'File::Glob' => qw/glob/;#'File::Glob' => qw/bsd_glob/;#g" $</test/build.info
+	@sed -i "s#'File::Glob' => qw/glob/;#'File::Glob' => qw/bsd_glob/;#g" $</test/run_tests.pl
+	@sed -i "s#'File::Glob' => qw/glob/;#'File::Glob' => qw/bsd_glob/;#g" $</util/process_docs.pl
+	@sed -i "s#'File::Glob' => qw/glob/;#'File::Glob' => qw/bsd_glob/;#g" $</Configure
 	@$(SHELL) -c "cd $< && ./config $(OPENSSL_OPTS)"
 endif
 	@$(MAKE) -C $< depend
